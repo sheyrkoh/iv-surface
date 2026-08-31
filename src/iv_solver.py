@@ -18,6 +18,9 @@ import numpy as np
 from scipy.optimize import brentq
 
 import pricer
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Search bracket for sigma, in decimals. 0.1% to 500% annualised.
 SIGMA_LOWER = 0.001
@@ -55,3 +58,63 @@ def price_bounds(S, K, T, r, q=0.0, option_type="call"):
         raise ValueError("option_type must be 'call' or 'put'")
 
     return lower, upper
+
+def implied_vol(market_price, S, K, T, r, q=0.0, option_type="call",
+                 max_iter=50, tol=1e-8):
+    """
+    Solve for the Black-Scholes implied volatility that reproduces
+    market_price.
+
+    Returns:
+        float: implied volatility (decimal, e.g. 0.20 for 20%), or
+        float('nan') if no volatility exists that reproduces the price,
+        or if the result would not be numerically reliable.
+    """
+    lower, upper = price_bounds(S, K, T, r, q, option_type)
+
+    if market_price <= lower + 1e-6:
+        logger.warning("Market price is below the no-arbitrage bounds: S=%s K=%s T=%s price=%s", S, K, T, market_price)
+        return float('nan')
+    if market_price >= upper - 1e-6:
+        logger.warning("Market price is above the no-arbitrage bounds: S=%s K=%s T=%s price=%s", S, K, T, market_price)
+        return float('nan')
+
+    # Newton-Raphson fast path.
+    sigma = 0.20  # initial guess
+
+    for i in range(max_iter):
+        price = _price(S, K, T, r, sigma, q, option_type)
+        diff = price - market_price
+
+        if abs(diff) < tol:
+            return sigma
+
+        derivative_ = pricer.vega(S, K, T, r, sigma, q) * 100.0  # convert to decimal sigma derivative
+
+        # No solver can find a reliable solution here — the option's price is
+        # genuinely insensitive to volatility, so any sigma "recovered" would
+        # be dressing up noise as a number.
+ 
+        if abs(derivative_) < 1e-4:
+            logger.warning("Price is insensitive to volatility at this point so no solution exists: S=%s K=%s T=%s sigma=%s", S, K, T, sigma)
+            return float('nan')
+
+        # Then also guard: did sigma_new leave [SIGMA_LOWER, SIGMA_UPPER]?
+        # If so, that's a sign Newton is misbehaving in a flat region —
+        # break rather than trusting the step.
+
+        sigma_new = sigma - diff / derivative_
+        if sigma_new < SIGMA_LOWER or sigma_new > SIGMA_UPPER:
+            break
+
+        sigma = sigma_new
+
+    # Newton either didn't converge in time or hit the bracket-exit guard
+    # Use Brent's method to find a root in [SIGMA_LOWER, SIGMA_UPPER].
+
+    f = lambda sigma: _price(S, K, T, r, sigma, q, option_type) - market_price
+    try:
+        return brentq(f, SIGMA_LOWER, SIGMA_UPPER)
+    except ValueError:
+        logger.warning("brentq found no bracket for S=%s, K=%s, T=%s, price=%s", S, K, T, market_price)
+        return float('nan')
